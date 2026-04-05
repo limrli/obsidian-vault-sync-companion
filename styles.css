@@ -1,0 +1,34 @@
+.vault-sync-companion-status {
+  cursor: pointer;
+}
+
+.vault-sync-companion-status.is-busy {
+  opacity: 0.65;
+}
+
+.vault-sync-companion-row {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: 112px 1fr;
+  margin: 8px 0;
+}
+
+.vault-sync-companion-label {
+  color: var(--text-muted);
+}
+
+.vault-sync-companion-value {
+  word-break: break-word;
+}
+
+.vault-sync-companion-warning {
+  color: var(--text-warning);
+}
+
+.vault-sync-companion-error {
+  color: var(--text-error);
+}
+
+.vault-sync-companion-actions {
+  margin-top: 18px;
+}
