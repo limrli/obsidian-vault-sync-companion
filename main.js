@@ -179,6 +179,66 @@ function parseBranchStatus(statusText) {
   };
 }
 
+class BeginnerGuideModal extends Modal {
+  constructor(app) {
+    super(app);
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: "Vault Sync Beginner Guide" });
+    contentEl.createEl("p", {
+      text: "This plugin helps two computers share one Obsidian vault through Git. You do not need to learn every Git command to use it safely."
+    });
+
+    contentEl.createEl("h3", { text: "What Each Action Does" });
+    const actionList = contentEl.createEl("ul");
+    [
+      "Pull Latest: downloads the newest version from your remote repository before you start writing.",
+      "Save and Push: saves all current vault changes, creates a Git commit, then uploads it to the remote repository.",
+      "Open status panel: shows whether this computer is ahead, behind, or has unsaved changes."
+    ].forEach((text) => actionList.createEl("li", { text }));
+
+    contentEl.createEl("h3", { text: "Simple Daily Workflow" });
+    const workflowList = contentEl.createEl("ol");
+    [
+      "Open Obsidian and wait for the auto-pull notice.",
+      "Write or edit your notes as usual.",
+      "Before switching to your other computer, use Save and Push or let the close sync run.",
+      "On the other computer, open Obsidian and let it pull first before editing."
+    ].forEach((text) => workflowList.createEl("li", { text }));
+
+    contentEl.createEl("h3", { text: "Notice Examples" });
+    const noticeList = contentEl.createEl("ul");
+    [
+      "Auto pull started: the plugin has begun checking the remote repository.",
+      "Already up to date: nothing new was found, so you can work normally.",
+      "Pulled latest changes: this computer just received changes from the other computer.",
+      "Auto pull skipped because local changes are present: this computer already has uncommitted edits, so it avoided overwriting anything.",
+      "Last close sync succeeded: the background sync after closing Obsidian completed successfully.",
+      "Close sync skipped because remote changed: the other computer already pushed new work, so this plugin stopped and asked you to do a manual sync."
+    ].forEach((text) => noticeList.createEl("li", { text }));
+
+    contentEl.createEl("h3", { text: "What Ahead / Behind Means" });
+    const explainList = contentEl.createEl("ul");
+    [
+      "Ahead 1: this computer has one local commit that has not been pushed yet.",
+      "Behind 1: the remote repository has one newer commit from another computer.",
+      "Dirty files: files changed in this vault but not saved into a Git commit yet."
+    ].forEach((text) => explainList.createEl("li", { text }));
+
+    contentEl.createEl("h3", { text: "When To Stop And Check" });
+    const warningList = contentEl.createEl("ul");
+    [
+      "If you see rebase in progress, stop using the sync buttons and resolve it first.",
+      "If both computers edited the same note before syncing, Git may ask for manual conflict resolution.",
+      "If auto close sync is skipped because remote changed, open Obsidian again and run Pull Latest or Save and Push manually."
+    ].forEach((text) => warningList.createEl("li", { text }));
+  }
+}
+
 class SyncStatusModal extends Modal {
   constructor(app, plugin, initialSnapshot = null) {
     super(app);
@@ -269,6 +329,12 @@ class SyncStatusModal extends Modal {
               await this.plugin.commitAndPush({ interactive: true });
             });
             await this.refresh();
+          })
+      )
+      .addButton((button) =>
+        button.setButtonText("Beginner Guide")
+          .onClick(() => {
+            this.plugin.openBeginnerGuide();
           })
       );
   }
@@ -409,6 +475,14 @@ class VaultSyncCompanionSettingTab extends PluginSettingTab {
           .setCta()
           .onClick(() => this.plugin.openStatusModal())
       );
+
+    new Setting(containerEl)
+      .setName("Open beginner guide")
+      .setDesc("See plain-language examples of what each sync action does.")
+      .addButton((button) =>
+        button.setButtonText("Open guide")
+          .onClick(() => this.plugin.openBeginnerGuide())
+      );
   }
 }
 
@@ -439,6 +513,12 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       id: "vault-sync-open-status",
       name: "Vault Sync: Open status panel",
       callback: () => this.openStatusModal()
+    });
+
+    this.addCommand({
+      id: "vault-sync-open-beginner-guide",
+      name: "Vault Sync: Open beginner guide",
+      callback: () => this.openBeginnerGuide()
     });
 
     this.addCommand({
@@ -538,6 +618,10 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
 
   openStatusModal() {
     new SyncStatusModal(this.app, this, this.lastSnapshot || null).open();
+  }
+
+  openBeginnerGuide() {
+    new BeginnerGuideModal(this.app).open();
   }
 
   notify(message, timeout = 6000, force = false) {
