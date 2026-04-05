@@ -70,9 +70,18 @@ try {
 
   Set-Location -LiteralPath $payload.repoPath
 
+  Invoke-Git @("fetch", $payload.remoteName, "--prune") | Out-Null
   $status = Invoke-Git @("status", "--porcelain=v1", "--branch")
+  $header = (($status -split "\`r?\`n")[0]).Trim()
   $dirtyLines = @($status -split "\`r?\`n" | Select-Object -Skip 1 | Where-Object { $_.Trim() })
   $hasDirty = $dirtyLines.Count -gt 0
+  $behindMatch = [regex]::Match($header, "behind\s+(\d+)")
+  $behindCount = if ($behindMatch.Success) { [int]$behindMatch.Groups[1].Value } else { 0 }
+
+  if ($hasDirty -and $behindCount -gt 0) {
+    Write-ResultFile -Ok $false -Summary "close sync skipped" -ErrorMessage "remote changed while this device still had local edits; open Obsidian and run a manual sync"
+    exit 0
+  }
 
   $createdCommit = $false
   if ($hasDirty) {
@@ -100,7 +109,8 @@ try {
     $behindAfterFetchCount = if ($behindAfterFetch.Success) { [int]$behindAfterFetch.Groups[1].Value } else { 0 }
 
     if ($behindAfterFetchCount -gt 0) {
-      Invoke-Git @("pull", "--rebase", $payload.remoteName, $payload.branchName) | Out-Null
+      Write-ResultFile -Ok $false -Summary "close sync skipped" -ErrorMessage "remote changed during background sync; open Obsidian and run a manual sync"
+      exit 0
     }
 
     Invoke-Git @("push", $payload.remoteName, $payload.branchName) | Out-Null
@@ -536,6 +546,11 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     }
   }
 
+  async fetchRemote(snapshot) {
+    await this.runGit(["fetch", snapshot.remoteName, "--prune"], snapshot.repoPath);
+    return await this.getRepositoryStatus();
+  }
+
   async writeCloseSyncResult(result) {
     const resultPath = this.getCloseSyncResultPath();
     fs.writeFileSync(resultPath, JSON.stringify({
@@ -618,6 +633,7 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     let snapshot;
     try {
       snapshot = await this.getRepositoryStatus();
+      snapshot = await this.fetchRemote(snapshot);
     } catch (error) {
       await this.writeCloseSyncResult({
         ok: false,
@@ -632,6 +648,15 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
         ok: false,
         summary: "close sync skipped",
         error: "a rebase is in progress"
+      });
+      return;
+    }
+
+    if (snapshot.dirtyCount > 0 && snapshot.behind > 0) {
+      await this.writeCloseSyncResult({
+        ok: false,
+        summary: "close sync skipped",
+        error: "remote changed while this device still had local edits; run a manual sync to review possible conflicts"
       });
       return;
     }
@@ -779,11 +804,13 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
   }
 
   async pullLatest({ interactive = true, startup = false } = {}) {
-    const snapshot = await this.getRepositoryStatus();
+    let snapshot = await this.getRepositoryStatus();
 
     if (snapshot.rebaseInProgress) {
       throw new Error("A rebase is already in progress. Finish or abort it first.");
     }
+
+    snapshot = await this.fetchRemote(snapshot);
 
     if (snapshot.dirtyCount > 0) {
       if (interactive || startup) {
@@ -792,7 +819,6 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       return snapshot;
     }
 
-    await this.runGit(["fetch", snapshot.remoteName, "--prune"], snapshot.repoPath);
     const result = await this.runGit(
       ["pull", "--ff-only", snapshot.remoteName, snapshot.branchName],
       snapshot.repoPath
@@ -813,10 +839,20 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
   }
 
   async commitAndPush({ interactive = true } = {}) {
-    const snapshot = await this.getRepositoryStatus();
+    let snapshot = await this.getRepositoryStatus();
 
     if (snapshot.rebaseInProgress) {
       throw new Error("A rebase is already in progress. Finish or abort it first.");
+    }
+
+    snapshot = await this.fetchRemote(snapshot);
+
+    if (interactive && snapshot.dirtyCount > 0 && snapshot.behind > 0) {
+      this.notify(
+        "Vault Sync: another device already pushed new changes. This sync will try a rebase, and you may need to resolve conflicts.",
+        9000,
+        true
+      );
     }
 
     let createdCommit = false;
@@ -832,12 +868,12 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       }
     }
 
-    await this.runGit(["fetch", snapshot.remoteName, "--prune"], snapshot.repoPath);
+    snapshot = await this.fetchRemote(snapshot);
 
     try {
       await this.runGit(["pull", "--rebase", snapshot.remoteName, snapshot.branchName], snapshot.repoPath);
     } catch (_) {
-      throw new Error("Pull with rebase failed. Open terminal, run git status, and resolve the rebase.");
+      throw new Error("Pull with rebase failed, likely because another device changed overlapping files. Open terminal, run git status, and resolve the rebase.");
     }
 
     await this.runGit(["push", snapshot.remoteName, snapshot.branchName], snapshot.repoPath);
