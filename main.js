@@ -13,6 +13,7 @@ const DEFAULT_SETTINGS = {
   branchName: "",
   autoPullOnStartup: true,
   autoSyncOnClose: true,
+  showAutoSyncNotices: true,
   statusRefreshSeconds: 90,
   commitMessageTemplate: "vault sync: {{device}} {{timestamp}}",
   lastSuccessfulSyncAt: "",
@@ -258,6 +259,17 @@ class VaultSyncCompanionSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Show auto-sync notices")
+      .setDesc("Show popup notices when startup pull and close sync run automatically.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.showAutoSyncNotices)
+          .onChange(async (value) => {
+            this.plugin.settings.showAutoSyncNotices = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
       .setName("Status refresh seconds")
       .setDesc("How often the status bar refreshes itself.")
       .addText((text) =>
@@ -356,6 +368,7 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
 
     if (this.settings.autoPullOnStartup) {
       window.setTimeout(async () => {
+        this.notify("Vault Sync: auto pull started.", 5000, true);
         await this.runWithLock("startup-pull", async () => {
           await this.pullLatest({ interactive: false, startup: true });
         }).catch(() => {});
@@ -407,6 +420,20 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     new SyncStatusModal(this.app, this, this.lastSnapshot || null).open();
   }
 
+  notify(message, timeout = 6000, force = false) {
+    if (force || this.settings.showAutoSyncNotices) {
+      new Notice(message, timeout);
+    }
+  }
+
+  async writeCloseSyncResult(result) {
+    const resultPath = this.getCloseSyncResultPath();
+    fs.writeFileSync(resultPath, JSON.stringify({
+      ...result,
+      finishedAt: result.finishedAt || formatTimestamp(new Date())
+    }, null, 2), "utf8");
+  }
+
   async runWithLock(label, action) {
     if (this.operationInProgress) {
       new Notice("Vault Sync is already running another operation. Please wait.");
@@ -449,9 +476,9 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       await this.saveData(this.settings);
 
       if (result.ok) {
-        new Notice(`Vault Sync: last close sync succeeded (${result.summary || "done"})`, 6000);
+        this.notify(`Vault Sync: last close sync succeeded (${result.summary || "done"}).`, 7000, true);
       } else {
-        new Notice(`Vault Sync: last close sync failed: ${result.error || "unknown error"}`, 10000);
+        this.notify(`Vault Sync: last close sync failed: ${result.error || "unknown error"}`, 10000, true);
       }
     } catch (_) {
       // Ignore invalid local worker result files.
@@ -463,20 +490,39 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       return;
     }
 
-    if (!this.settings.autoSyncOnClose || this.closeSyncTriggered || this.operationInProgress) {
+    if (!this.settings.autoSyncOnClose || this.closeSyncTriggered) {
       return;
     }
 
     this.closeSyncTriggered = true;
 
+    if (this.operationInProgress) {
+      await this.writeCloseSyncResult({
+        ok: false,
+        summary: "close sync skipped",
+        error: "another Vault Sync operation was still running when Obsidian closed"
+      });
+      return;
+    }
+
     let snapshot;
     try {
       snapshot = await this.getRepositoryStatus();
-    } catch (_) {
+    } catch (error) {
+      await this.writeCloseSyncResult({
+        ok: false,
+        summary: "close sync skipped",
+        error: error.message || String(error)
+      });
       return;
     }
 
     if (snapshot.rebaseInProgress) {
+      await this.writeCloseSyncResult({
+        ok: false,
+        summary: "close sync skipped",
+        error: "a rebase is in progress"
+      });
       return;
     }
 
@@ -497,6 +543,11 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
 
     try {
       fs.writeFileSync(this.getCloseSyncPayloadPath(), JSON.stringify(payload, null, 2), "utf8");
+      this.notify(
+        "Vault Sync: auto save and push started in background. Final result will appear next time you open Obsidian.",
+        8000,
+        true
+      );
 
       const child = spawn(
         "powershell.exe",
@@ -514,8 +565,12 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       );
 
       child.unref();
-    } catch (_) {
-      // Do not block app closing if the background worker could not start.
+    } catch (error) {
+      await this.writeCloseSyncResult({
+        ok: false,
+        summary: "close sync failed to start",
+        error: error.message || String(error)
+      });
     }
   }
 
@@ -620,8 +675,8 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     }
 
     if (snapshot.dirtyCount > 0) {
-      if (interactive) {
-        new Notice("Vault Sync: you have local changes. Save and Push first for a safer sync.", 7000);
+      if (interactive || startup) {
+        this.notify("Vault Sync: auto pull skipped because local changes are present.", 7000, startup);
       }
       return snapshot;
     }
@@ -640,7 +695,7 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       : "pulled latest changes";
 
     if (interactive || startup) {
-      new Notice(`Vault Sync: ${message}`);
+      this.notify(`Vault Sync: ${message}.`, 6000, startup);
     }
 
     return await this.refreshStatus();
