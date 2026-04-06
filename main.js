@@ -134,6 +134,9 @@ function normalizeOutput(value) {
   return (value || "").replace(/\r\n/g, "\n").trim();
 }
 
+const LARGE_CHANGE_WARNING_COUNT = 500;
+const HUGE_CHANGE_WARNING_COUNT = 2000;
+
 function formatTimestamp(date = new Date()) {
   const datePart = [
     date.getFullYear(),
@@ -146,6 +149,30 @@ function formatTimestamp(date = new Date()) {
     String(date.getSeconds()).padStart(2, "0")
   ].join(":");
   return `${datePart} ${timePart}`;
+}
+
+function countListedFiles(text) {
+  return normalizeOutput(text).split("\n").filter(Boolean).length;
+}
+
+function countConflictEntries(entries = []) {
+  return entries.filter((line) => {
+    const statusCode = String(line || "").slice(0, 2);
+    return statusCode.includes("U") || statusCode === "AA" || statusCode === "DD";
+  }).length;
+}
+
+function formatChangeSize(count) {
+  if (count >= HUGE_CHANGE_WARNING_COUNT) {
+    return "huge batch";
+  }
+  if (count >= LARGE_CHANGE_WARNING_COUNT) {
+    return "large batch";
+  }
+  if (count > 0) {
+    return "normal batch";
+  }
+  return "clean";
 }
 
 function parseBranchStatus(statusText) {
@@ -176,6 +203,98 @@ function parseBranchStatus(statusText) {
     ahead,
     behind,
     dirtyEntries: lines.slice(1)
+  };
+}
+
+function buildSnapshotAdvice(snapshot) {
+  if (snapshot.rebaseInProgress) {
+    return {
+      summary: "Sync is paused because Git is currently in the middle of a rebase.",
+      details: [
+        snapshot.conflictedCount > 0
+          ? `${snapshot.conflictedCount} conflicted file(s) still need your decision.`
+          : "Git is replaying local work on top of newer remote commits.",
+        "Your notes are usually still safe because Git already created or replayed a local commit before stopping.",
+        "Open terminal in this vault, run git status, resolve the listed files, then run git rebase --continue."
+      ],
+      cls: "vault-sync-companion-warning"
+    };
+  }
+
+  if (snapshot.dirtyCount > 0 && snapshot.behind > 0) {
+    return {
+      summary: "This vault has local edits and the other device has already pushed newer work.",
+      details: [
+        "Save and Push may need a rebase or manual conflict resolution.",
+        snapshot.dirtyCount >= LARGE_CHANGE_WARNING_COUNT
+          ? `This is a ${snapshot.changeSizeLabel} with ${snapshot.dirtyCount} changed files, so the sync may take noticeably longer.`
+          : `There are ${snapshot.dirtyCount} local changed files waiting to be saved.`,
+        "If both devices changed the same note, Git may pause and wait for you to resolve conflicts."
+      ],
+      cls: "vault-sync-companion-warning"
+    };
+  }
+
+  if (snapshot.dirtyCount >= HUGE_CHANGE_WARNING_COUNT) {
+    return {
+      summary: "This vault currently has a huge batch of local changes.",
+      details: [
+        `Git sees ${snapshot.dirtyCount} changed files.`,
+        "Save and Push should still work, but staging and committing may take longer than usual.",
+        "It is safest to let the operation finish before editing more notes or switching devices."
+      ],
+      cls: "vault-sync-companion-warning"
+    };
+  }
+
+  if (snapshot.dirtyCount >= LARGE_CHANGE_WARNING_COUNT) {
+    return {
+      summary: "This vault currently has a large batch of local changes.",
+      details: [
+        `Git sees ${snapshot.dirtyCount} changed files.`,
+        "Save and Push should work, but expect it to run longer than a small daily sync."
+      ],
+      cls: "vault-sync-companion-warning"
+    };
+  }
+
+  if (snapshot.dirtyCount > 0) {
+    return {
+      summary: "You have local changes waiting to be saved into Git.",
+      details: [
+        `There are ${snapshot.dirtyCount} changed files in this vault.`,
+        "Use Save and Push when you finish this session."
+      ],
+      cls: "vault-sync-companion-warning"
+    };
+  }
+
+  if (snapshot.behind > 0) {
+    return {
+      summary: "The other device has newer commits ready to pull.",
+      details: [
+        `This vault is behind by ${snapshot.behind} commit(s).`,
+        "Pull Latest is the safest next step before editing."
+      ],
+      cls: ""
+    };
+  }
+
+  if (snapshot.ahead > 0) {
+    return {
+      summary: "This device already has local commits that have not been pushed yet.",
+      details: [
+        `This vault is ahead by ${snapshot.ahead} commit(s).`,
+        "Use Save and Push to upload them."
+      ],
+      cls: "vault-sync-companion-warning"
+    };
+  }
+
+  return {
+    summary: "Workspace is clean. Pull Latest is safe before you start writing.",
+    details: [],
+    cls: ""
   };
 }
 
@@ -218,7 +337,9 @@ class BeginnerGuideModal extends Modal {
       "Pulled latest changes: this computer just received changes from the other computer.",
       "Auto pull skipped because local changes are present: this computer already has uncommitted edits, so it avoided overwriting anything.",
       "Last close sync succeeded: the background sync after closing Obsidian completed successfully.",
-      "Close sync skipped because remote changed: the other computer already pushed new work, so this plugin stopped and asked you to do a manual sync."
+      "Close sync skipped because remote changed: the other computer already pushed new work, so this plugin stopped and asked you to do a manual sync.",
+      "Large batch detected: Git sees hundreds or thousands of changed files, so this save may take longer than usual.",
+      "Sync paused because Git is rebasing: another device changed overlapping files, so Git needs manual conflict resolution before syncing can continue."
     ].forEach((text) => noticeList.createEl("li", { text }));
 
     contentEl.createEl("h3", { text: "What Ahead / Behind Means" });
@@ -236,6 +357,14 @@ class BeginnerGuideModal extends Modal {
       "If both computers edited the same note before syncing, Git may ask for manual conflict resolution.",
       "If auto close sync is skipped because remote changed, open Obsidian again and run Pull Latest or Save and Push manually."
     ].forEach((text) => warningList.createEl("li", { text }));
+
+    contentEl.createEl("h3", { text: "Large Import Example" });
+    const importList = contentEl.createEl("ul");
+    [
+      "If you import thousands of notes at once, Save and Push may take longer because Git must scan and record every changed file.",
+      "If the other computer also changed the vault, the plugin will warn that a rebase may happen before it pushes.",
+      "If the rebase stops, your local commit is usually already created, so the notes are not lost. Finish the rebase first, then sync again."
+    ].forEach((text) => importList.createEl("li", { text }));
   }
 }
 
@@ -281,6 +410,8 @@ class SyncStatusModal extends Modal {
       ["Tracking", snapshot.trackingBranch || `${snapshot.remoteName}/${snapshot.branchName}`],
       ["Remote", snapshot.remoteUrl || snapshot.remoteName],
       ["Dirty files", String(snapshot.dirtyCount)],
+      ["Conflicts", String(snapshot.conflictedCount)],
+      ["Change size", snapshot.changeSizeLabel],
       ["Ahead / Behind", `up ${snapshot.ahead} / down ${snapshot.behind}`],
       ["Last sync", snapshot.lastSuccessfulSyncAt || "not recorded"]
     ];
@@ -291,18 +422,16 @@ class SyncStatusModal extends Modal {
       rowEl.createDiv({ text: value, cls: "vault-sync-companion-value" });
     }
 
-    let summary = "Workspace is clean. Pull latest is safe.";
-    if (snapshot.rebaseInProgress) {
-      summary = "A rebase is in progress. Finish or abort it in terminal before syncing again.";
-    } else if (snapshot.dirtyCount > 0) {
-      summary = "You have local changes. Use Save and Push when you finish this session.";
-    }
+    const advice = buildSnapshotAdvice(snapshot);
     contentEl.createEl("p", {
-      text: summary,
-      cls: snapshot.rebaseInProgress || snapshot.dirtyCount > 0
-        ? "vault-sync-companion-warning"
-        : ""
+      text: advice.summary,
+      cls: advice.cls
     });
+
+    if (advice.details.length > 0) {
+      const detailList = contentEl.createEl("ul", { cls: "vault-sync-companion-list" });
+      advice.details.forEach((text) => detailList.createEl("li", { text }));
+    }
 
     const actions = contentEl.createDiv({ cls: "vault-sync-companion-actions" });
     new Setting(actions)
@@ -630,6 +759,40 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     }
   }
 
+  toUserFacingError(error, context, snapshot = this.lastSnapshot) {
+    const raw = error?.message || String(error);
+    const latest = snapshot || this.lastSnapshot || {};
+
+    if (/rebase is already in progress/i.test(raw) || latest.rebaseInProgress) {
+      const conflictHint = latest.conflictedCount > 0
+        ? ` ${latest.conflictedCount} conflicted file(s) are still waiting.`
+        : "";
+      return new Error(
+        `Git is currently rebasing, so Vault Sync stopped to protect your notes.${conflictHint} Open terminal in this vault, run git status, resolve the listed files, then run git rebase --continue.`
+      );
+    }
+
+    if (/index\.lock/i.test(raw) || /Another git process seems to be running/i.test(raw)) {
+      return new Error(
+        "Git looks busy right now because another Git process or lock file is still active. Wait a moment, close other Git windows, then try again."
+      );
+    }
+
+    if (/not a git repository/i.test(raw)) {
+      return new Error(
+        "Vault Sync could not find a Git repository for this vault. Check the repository path setting and make sure this Obsidian folder is really inside a Git repo."
+      );
+    }
+
+    if (context === "pull-latest" && /ff-only/i.test(raw)) {
+      return new Error(
+        "Pull Latest could not do a fast-forward update. This usually means local history already differs from the remote, so review the status panel or terminal before trying again."
+      );
+    }
+
+    return new Error(raw);
+  }
+
   async fetchRemote(snapshot) {
     await this.runGit(["fetch", snapshot.remoteName, "--prune"], snapshot.repoPath);
     return await this.getRepositoryStatus();
@@ -656,8 +819,9 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     try {
       return await action();
     } catch (error) {
-      new Notice(`Vault Sync: ${error.message || String(error)}`, 8000);
-      throw error;
+      const friendlyError = this.toUserFacingError(error, label, this.lastSnapshot);
+      new Notice(`Vault Sync: ${friendlyError.message || String(friendlyError)}`, 12000);
+      throw friendlyError;
     } finally {
       this.operationInProgress = false;
       this.statusBarEl?.removeClass("is-busy");
@@ -846,6 +1010,8 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       behind: parsed.behind,
       dirtyCount: parsed.dirtyEntries.length,
       dirtyEntries: parsed.dirtyEntries,
+      conflictedCount: countConflictEntries(parsed.dirtyEntries),
+      changeSizeLabel: formatChangeSize(parsed.dirtyEntries.length),
       rebaseInProgress,
       lastSuccessfulSyncAt: this.settings.lastSuccessfulSyncAt || ""
     };
@@ -862,9 +1028,14 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
 
     let text = `Vault Sync: ${snapshot.branchName}`;
     if (snapshot.rebaseInProgress) {
-      text += " | rebase";
+      text += snapshot.conflictedCount > 0
+        ? ` | rebase ${snapshot.conflictedCount} conflict`
+        : " | rebase";
     } else if (snapshot.dirtyCount > 0) {
       text += ` | ${snapshot.dirtyCount} dirty`;
+      if (snapshot.dirtyCount >= LARGE_CHANGE_WARNING_COUNT) {
+        text += " (large)";
+      }
     } else if (snapshot.ahead > 0 || snapshot.behind > 0) {
       text += ` | up ${snapshot.ahead} down ${snapshot.behind}`;
     } else {
@@ -894,13 +1065,25 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       throw new Error("A rebase is already in progress. Finish or abort it first.");
     }
 
+    if (interactive) {
+      this.notify("Vault Sync: checking remote changes before pull...", 4000, true);
+    }
+
     snapshot = await this.fetchRemote(snapshot);
 
     if (snapshot.dirtyCount > 0) {
       if (interactive || startup) {
-        this.notify("Vault Sync: auto pull skipped because local changes are present.", 7000, startup);
+        this.notify(
+          `Vault Sync: pull skipped because ${snapshot.dirtyCount} local changed file(s) are present. Save or review them first.`,
+          9000,
+          startup
+        );
       }
       return snapshot;
+    }
+
+    if (interactive && snapshot.behind > 0) {
+      this.notify(`Vault Sync: remote has ${snapshot.behind} newer commit(s). Pulling now...`, 5000, true);
     }
 
     const result = await this.runGit(
@@ -929,37 +1112,89 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       throw new Error("A rebase is already in progress. Finish or abort it first.");
     }
 
+    if (interactive) {
+      this.notify("Vault Sync: checking repository state...", 4000, true);
+    }
+
     snapshot = await this.fetchRemote(snapshot);
+
+    if (interactive && snapshot.dirtyCount >= HUGE_CHANGE_WARNING_COUNT) {
+      this.notify(
+        `Vault Sync: detected ${snapshot.dirtyCount} changed files. This is a huge batch, so saving may take a while.`,
+        10000,
+        true
+      );
+    } else if (interactive && snapshot.dirtyCount >= LARGE_CHANGE_WARNING_COUNT) {
+      this.notify(
+        `Vault Sync: detected ${snapshot.dirtyCount} changed files. This is a large batch, so saving may be slower than usual.`,
+        9000,
+        true
+      );
+    }
 
     if (interactive && snapshot.dirtyCount > 0 && snapshot.behind > 0) {
       this.notify(
-        "Vault Sync: another device already pushed new changes. This sync will try a rebase, and you may need to resolve conflicts.",
-        9000,
+        `Vault Sync: another device already pushed ${snapshot.behind} newer commit(s). This save may need a rebase, and manual conflict resolution may be required.`,
+        10000,
         true
       );
     }
 
     let createdCommit = false;
     let commitMessage = "";
+    let stagedCount = 0;
 
     if (snapshot.dirtyCount > 0) {
+      if (interactive) {
+        this.notify("Vault Sync: staging local changes...", 5000, true);
+      }
       await this.runGit(["add", "-A"], snapshot.repoPath);
       const staged = await this.runGit(["diff", "--cached", "--name-only"], snapshot.repoPath);
+      stagedCount = countListedFiles(staged.stdout);
       if (normalizeOutput(staged.stdout)) {
         commitMessage = this.buildCommitMessage(snapshot);
+        if (interactive) {
+          this.notify(
+            `Vault Sync: creating a local save point for ${stagedCount} file(s)...`,
+            6000,
+            true
+          );
+        }
         await this.runGit(["commit", "-m", commitMessage], snapshot.repoPath);
         createdCommit = true;
       }
     }
 
+    if (interactive) {
+      this.notify("Vault Sync: checking remote again before upload...", 5000, true);
+    }
     snapshot = await this.fetchRemote(snapshot);
 
     try {
+      if (interactive && snapshot.behind > 0) {
+        this.notify(
+          `Vault Sync: remote is still ahead by ${snapshot.behind} commit(s). Trying a rebase before push...`,
+          8000,
+          true
+        );
+      }
       await this.runGit(["pull", "--rebase", snapshot.remoteName, snapshot.branchName], snapshot.repoPath);
     } catch (_) {
-      throw new Error("Pull with rebase failed, likely because another device changed overlapping files. Open terminal, run git status, and resolve the rebase.");
+      const afterFailure = await this.refreshStatus().catch(() => snapshot);
+      const conflictText = afterFailure.conflictedCount > 0
+        ? `${afterFailure.conflictedCount} conflicted file(s) are now waiting for manual resolution.`
+        : "Git needs a manual review before it can continue.";
+      const localSaveText = createdCommit
+        ? `Your local changes were already saved in commit: ${commitMessage}.`
+        : "Your local changes were not deleted, but sync could not continue automatically.";
+      throw new Error(
+        `Sync paused because another device changed overlapping files. ${localSaveText} ${conflictText} Open terminal in this vault, run git status, then resolve the rebase and continue with git rebase --continue.`
+      );
     }
 
+    if (interactive) {
+      this.notify("Vault Sync: pushing commits to the remote repository...", 5000, true);
+    }
     await this.runGit(["push", snapshot.remoteName, snapshot.branchName], snapshot.repoPath);
 
     this.settings.lastSuccessfulSyncAt = formatTimestamp(new Date());
@@ -971,7 +1206,7 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     if (interactive) {
       new Notice(
         createdCommit
-          ? `Vault Sync: committed and pushed. ${commitMessage}`
+          ? `Vault Sync: saved and pushed successfully. ${stagedCount || snapshot.dirtyCount} file(s) were included. ${commitMessage}`
           : "Vault Sync: no new local changes, push check completed."
       );
     }
@@ -988,7 +1223,7 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
         args,
         {
           cwd,
-          maxBuffer: 10 * 1024 * 1024,
+          maxBuffer: 64 * 1024 * 1024,
           windowsHide: true
         },
         (error, stdout, stderr) => {

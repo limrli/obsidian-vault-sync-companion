@@ -32,3 +32,11 @@
 .vault-sync-companion-actions {
   margin-top: 18px;
 }
+
+.vault-sync-companion-list {
+  margin: 8px 0 0 18px;
+}
+
+.vault-sync-companion-list li {
+  margin-bottom: 6px;
+}
