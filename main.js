@@ -63,6 +63,21 @@ function Invoke-Git {
   return ($output | Out-String).Trim()
 }
 
+function Get-ConflictPreview {
+  try {
+    $conflicts = Invoke-Git @("diff", "--name-only", "--diff-filter=U")
+    $lines = @($conflicts -split "\`r?\`n" | Where-Object { $_.Trim() } | Select-Object -First 5)
+    if ($lines.Count -gt 0) {
+      return ($lines -join ", ")
+    }
+  }
+  catch {
+    return ""
+  }
+
+  return ""
+}
+
 try {
   $payload = Get-Content -LiteralPath $PayloadPath -Raw | ConvertFrom-Json
   $script:GitBinary = $payload.gitBinary
@@ -109,12 +124,38 @@ try {
     $behindAfterFetchCount = if ($behindAfterFetch.Success) { [int]$behindAfterFetch.Groups[1].Value } else { 0 }
 
     if ($behindAfterFetchCount -gt 0) {
-      Write-ResultFile -Ok $false -Summary "close sync skipped" -ErrorMessage "remote changed during background sync; open Obsidian and run a manual sync"
-      exit 0
+      try {
+        Invoke-Git @("pull", "--rebase", $payload.remoteName, $payload.branchName) | Out-Null
+      }
+      catch {
+        $preview = Get-ConflictPreview
+        $message = if ($createdCommit) {
+          "remote and local changes could not be merged automatically. Your local work was already saved in commit '$($payload.commitMessage)'."
+        }
+        else {
+          "remote and local changes could not be merged automatically."
+        }
+
+        if ($preview) {
+          $message += " Conflicts: $preview."
+        }
+
+        $message += " Open Obsidian again, run git status in terminal, then finish with git rebase --continue."
+        Write-ResultFile -Ok $false -Summary "close sync paused for manual rebase" -ErrorMessage $message
+        exit 0
+      }
     }
 
     Invoke-Git @("push", $payload.remoteName, $payload.branchName) | Out-Null
-    $summary = if ($createdCommit) { "committed and pushed" } else { "pushed existing local commits" }
+    $summary = if ($createdCommit -and $behindAfterFetchCount -gt 0) {
+      "committed, merged remote changes, and pushed"
+    }
+    elseif ($createdCommit) {
+      "committed and pushed"
+    }
+    else {
+      "pushed existing local commits"
+    }
     Write-ResultFile -Ok $true -Summary $summary
   }
   else {
@@ -376,6 +417,7 @@ class BeginnerGuideModal extends Modal {
     const actionList = contentEl.createEl("ul");
     [
       "Pull Latest: downloads the newest version from your remote repository before you start writing.",
+      "If both computers changed different files, Pull Latest and Save and Push now let Git try an automatic merge first.",
       "Save and Push: saves all current vault changes, creates a Git commit, then uploads it to the remote repository.",
       "Open status panel: shows whether this computer is ahead, behind, or has unsaved changes."
     ].forEach((text) => actionList.createEl("li", { text }));
@@ -423,6 +465,7 @@ class BeginnerGuideModal extends Modal {
     const importList = contentEl.createEl("ul");
     [
       "If you import thousands of notes at once, Save and Push may take longer because Git must scan and record every changed file.",
+      "If the other computer only changed different files, the plugin now lets Git try the merge automatically.",
       "If the other computer also changed the vault, the plugin will warn that a rebase may happen before it pushes.",
       "If the rebase stops, your local commit is usually already created, so the notes are not lost. Finish the rebase first, then sync again."
     ].forEach((text) => importList.createEl("li", { text }));
@@ -851,6 +894,32 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     );
   }
 
+  async listUnmergedFiles(repoPath) {
+    try {
+      const result = await this.runGit(["diff", "--name-only", "--diff-filter=U"], repoPath);
+      return normalizeOutput(result.stdout).split("\n").filter(Boolean);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  async buildRebaseConflictError(repoPath, { createdCommit = false, commitMessage = "", context = "sync" } = {}) {
+    const conflictFiles = await this.listUnmergedFiles(repoPath);
+    const preview = formatPathPreview(conflictFiles);
+    const localSaveText = createdCommit
+      ? `Your local changes were already saved in commit: ${commitMessage}.`
+      : "Your local changes were not deleted, but sync could not continue automatically.";
+    const actionText = context === "pull"
+      ? "Open terminal in this vault, run git status, then resolve the rebase and finish with git rebase --continue before pulling again."
+      : "Open terminal in this vault, run git status, then resolve the rebase and finish with git rebase --continue before pushing again.";
+    const conflictText = conflictFiles.length
+      ? ` Conflicted files: ${preview}.`
+      : "";
+    return new Error(
+      `Sync paused because Git found overlapping edits that it could not merge automatically. ${localSaveText}${conflictText} ${actionText}`
+    );
+  }
+
   toUserFacingError(error, context, snapshot = this.lastSnapshot) {
     const raw = error?.message || String(error);
     const latest = snapshot || this.lastSnapshot || {};
@@ -988,15 +1057,6 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
         ok: false,
         summary: "close sync skipped",
         error: "a rebase is in progress"
-      });
-      return;
-    }
-
-    if (snapshot.dirtyCount > 0 && snapshot.behind > 0) {
-      await this.writeCloseSyncResult({
-        ok: false,
-        summary: "close sync skipped",
-        error: "remote changed while this device still had local edits; run a manual sync to review possible conflicts"
       });
       return;
     }
@@ -1190,6 +1250,51 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     }
 
     if (snapshot.dirtyCount > 0) {
+      if (snapshot.behind > 0 && snapshot.contentDirtyCount > 0) {
+        let createdCommit = false;
+        let commitMessage = "";
+        if (interactive || startup) {
+          this.notify(
+            `Vault Sync: local notes changed on this device and the remote also changed. Creating a safety commit, then trying Git auto-merge for ${snapshot.contentDirtyCount} content file(s)...`,
+            12000,
+            true
+          );
+        }
+
+        await this.runGit(["add", "-A"], snapshot.repoPath);
+        const staged = await this.runGit(["diff", "--cached", "--name-only"], snapshot.repoPath);
+        if (normalizeOutput(staged.stdout)) {
+          commitMessage = this.buildCommitMessage(snapshot);
+          await this.runGit(["commit", "-m", commitMessage], snapshot.repoPath);
+          createdCommit = true;
+        }
+
+        try {
+          await this.runGit(["pull", "--rebase", snapshot.remoteName, snapshot.branchName], snapshot.repoPath);
+        } catch (_) {
+          throw await this.buildRebaseConflictError(snapshot.repoPath, {
+            createdCommit,
+            commitMessage,
+            context: "pull"
+          });
+        }
+
+        this.settings.lastSuccessfulSyncAt = formatTimestamp(new Date());
+        await this.saveData(this.settings);
+
+        if (interactive || startup) {
+          this.notify(
+            createdCommit
+              ? `Vault Sync: Git merged different-file changes automatically and pulled the latest version. Local work was saved as: ${commitMessage}`
+              : "Vault Sync: Git merged different-file changes automatically and pulled the latest version.",
+            10000,
+            true
+          );
+        }
+
+        return await this.refreshStatus();
+      }
+
       if (interactive || startup) {
         const preview = formatPathPreview(snapshot.contentDirtyPaths.length ? snapshot.contentDirtyPaths : snapshot.dirtyPaths);
         const detail = snapshot.contentDirtyCount > 0
@@ -1314,16 +1419,11 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       }
       await this.runGit(["pull", "--rebase", snapshot.remoteName, snapshot.branchName], snapshot.repoPath);
     } catch (_) {
-      const afterFailure = await this.refreshStatus().catch(() => snapshot);
-      const conflictText = afterFailure.conflictedCount > 0
-        ? `${afterFailure.conflictedCount} conflicted file(s) are now waiting for manual resolution.`
-        : "Git needs a manual review before it can continue.";
-      const localSaveText = createdCommit
-        ? `Your local changes were already saved in commit: ${commitMessage}.`
-        : "Your local changes were not deleted, but sync could not continue automatically.";
-      throw new Error(
-        `Sync paused because another device changed overlapping files. ${localSaveText} ${conflictText} Open terminal in this vault, run git status, then resolve the rebase and continue with git rebase --continue.`
-      );
+      throw await this.buildRebaseConflictError(snapshot.repoPath, {
+        createdCommit,
+        commitMessage,
+        context: "push"
+      });
     }
 
     if (interactive) {
