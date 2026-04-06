@@ -175,6 +175,51 @@ function formatChangeSize(count) {
   return "clean";
 }
 
+const SAFE_LOCAL_STATE_PATTERNS = [
+  /^\.obsidian\/workspace(?:-mobile)?\.json$/i,
+  /^\.obsidian\/workspaces\.json$/i,
+  /^\.obsidian\/query\.json$/i,
+  /^\.obsidian\/stats\.json$/i,
+  /^\.obsidian\/view-count\.json$/i,
+  /^\.obsidian\/webviewer\.json$/i,
+  /^\.obsidian\/plugins\/recent-files-obsidian\/data\.json$/i,
+  /^\.obsidian\/plugins\/obsidian-mindmap-nextgen\/data\.json$/i,
+  /^\.obsidian\/plugins\/obsidian42-brat\/data\.json$/i,
+  /^\.obsidian\/plugins\/various-complements\/histories\.json$/i,
+  /^\.obsidian\/plugins\/vault-sync-companion\/close-sync-[^/]+\.json$/i,
+  /^\.stfolder\/.+/i
+];
+
+function extractDirtyPath(line) {
+  const raw = String(line || "").slice(3).trim();
+  const target = raw.includes(" -> ") ? raw.split(" -> ").pop() : raw;
+  return target.replace(/^"|"$/g, "");
+}
+
+function isSafeLocalStatePath(filePath) {
+  return SAFE_LOCAL_STATE_PATTERNS.some((pattern) => pattern.test(filePath));
+}
+
+function classifyDirtyEntries(entries = []) {
+  const paths = entries.map(extractDirtyPath).filter(Boolean);
+  const safeLocalOnlyPaths = paths.filter((filePath) => isSafeLocalStatePath(filePath));
+  const contentPaths = paths.filter((filePath) => !isSafeLocalStatePath(filePath));
+  return {
+    paths,
+    safeLocalOnlyPaths,
+    contentPaths
+  };
+}
+
+function formatPathPreview(paths, limit = 3) {
+  if (!paths.length) {
+    return "";
+  }
+  const shown = paths.slice(0, limit).join(", ");
+  const remaining = paths.length - Math.min(paths.length, limit);
+  return remaining > 0 ? `${shown} and ${remaining} more` : shown;
+}
+
 function parseBranchStatus(statusText) {
   const lines = normalizeOutput(statusText).split("\n").filter(Boolean);
   const header = lines[0] || "";
@@ -221,11 +266,26 @@ function buildSnapshotAdvice(snapshot) {
     };
   }
 
+  if (snapshot.contentDirtyCount === 0 && snapshot.safeLocalOnlyDirtyCount > 0 && snapshot.behind > 0) {
+    return {
+      summary: "Only local-only state files are blocking this pull.",
+      details: [
+        `${snapshot.safeLocalOnlyDirtyCount} local state file(s) changed on this device.`,
+        "These files are usually safe to discard before pulling newer notes from the other computer.",
+        "Use Pull Latest and the plugin will automatically discard these local-only files before syncing."
+      ],
+      cls: "vault-sync-companion-warning"
+    };
+  }
+
   if (snapshot.dirtyCount > 0 && snapshot.behind > 0) {
     return {
       summary: "This vault has local edits and the other device has already pushed newer work.",
       details: [
         "Save and Push may need a rebase or manual conflict resolution.",
+        snapshot.safeLocalOnlyDirtyCount > 0
+          ? `${snapshot.safeLocalOnlyDirtyCount} changed file(s) look like local-only state, but ${snapshot.contentDirtyCount} file(s) still look like real content edits.`
+          : `All ${snapshot.contentDirtyCount || snapshot.dirtyCount} changed file(s) look like real content edits.`,
         snapshot.dirtyCount >= LARGE_CHANGE_WARNING_COUNT
           ? `This is a ${snapshot.changeSizeLabel} with ${snapshot.dirtyCount} changed files, so the sync may take noticeably longer.`
           : `There are ${snapshot.dirtyCount} local changed files waiting to be saved.`,
@@ -336,6 +396,7 @@ class BeginnerGuideModal extends Modal {
       "Already up to date: nothing new was found, so you can work normally.",
       "Pulled latest changes: this computer just received changes from the other computer.",
       "Auto pull skipped because local changes are present: this computer already has uncommitted edits, so it avoided overwriting anything.",
+      "Pull will discard only local-only state files: only Obsidian local state changed, so the plugin can safely clean those files and continue pulling notes.",
       "Last close sync succeeded: the background sync after closing Obsidian completed successfully.",
       "Close sync skipped because remote changed: the other computer already pushed new work, so this plugin stopped and asked you to do a manual sync.",
       "Large batch detected: Git sees hundreds or thousands of changed files, so this save may take longer than usual.",
@@ -365,6 +426,14 @@ class BeginnerGuideModal extends Modal {
       "If the other computer also changed the vault, the plugin will warn that a rebase may happen before it pushes.",
       "If the rebase stops, your local commit is usually already created, so the notes are not lost. Finish the rebase first, then sync again."
     ].forEach((text) => importList.createEl("li", { text }));
+
+    contentEl.createEl("h3", { text: "Why Pull Was Skipped" });
+    const skippedList = contentEl.createEl("ul");
+    [
+      "If the plugin says local changes are present, it means this computer already changed some files and the plugin is avoiding silent overwrite.",
+      "If those changed files are only local Obsidian state files, Pull Latest can now discard them automatically and continue.",
+      "If real note files changed on this computer, the plugin will still stop and ask you to save or review them first."
+    ].forEach((text) => skippedList.createEl("li", { text }));
   }
 }
 
@@ -410,6 +479,8 @@ class SyncStatusModal extends Modal {
       ["Tracking", snapshot.trackingBranch || `${snapshot.remoteName}/${snapshot.branchName}`],
       ["Remote", snapshot.remoteUrl || snapshot.remoteName],
       ["Dirty files", String(snapshot.dirtyCount)],
+      ["Local-only dirty", String(snapshot.safeLocalOnlyDirtyCount)],
+      ["Content dirty", String(snapshot.contentDirtyCount)],
       ["Conflicts", String(snapshot.conflictedCount)],
       ["Change size", snapshot.changeSizeLabel],
       ["Ahead / Behind", `up ${snapshot.ahead} / down ${snapshot.behind}`],
@@ -431,6 +502,16 @@ class SyncStatusModal extends Modal {
     if (advice.details.length > 0) {
       const detailList = contentEl.createEl("ul", { cls: "vault-sync-companion-list" });
       advice.details.forEach((text) => detailList.createEl("li", { text }));
+    }
+
+    if (snapshot.dirtyPreview.length > 0) {
+      const previewHeading = contentEl.createEl("p", {
+        text: "Changed file preview:",
+        cls: "vault-sync-companion-label"
+      });
+      previewHeading.style.marginTop = "12px";
+      const previewList = contentEl.createEl("ul", { cls: "vault-sync-companion-list" });
+      snapshot.dirtyPreview.forEach((filePath) => previewList.createEl("li", { text: filePath }));
     }
 
     const actions = contentEl.createDiv({ cls: "vault-sync-companion-actions" });
@@ -759,6 +840,17 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     }
   }
 
+  async discardSafeLocalStateFiles(snapshot) {
+    if (!snapshot.safeLocalOnlyPaths.length) {
+      return;
+    }
+
+    await this.runGit(
+      ["restore", "--source=HEAD", "--staged", "--worktree", "--", ...snapshot.safeLocalOnlyPaths],
+      snapshot.repoPath
+    );
+  }
+
   toUserFacingError(error, context, snapshot = this.lastSnapshot) {
     const raw = error?.message || String(error);
     const latest = snapshot || this.lastSnapshot || {};
@@ -987,6 +1079,7 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     const info = await this.resolveRepositoryInfo();
     const gitStatus = await this.runGit(["status", "--porcelain=v1", "--branch"], info.repoPath);
     const parsed = parseBranchStatus(gitStatus.stdout);
+    const classified = classifyDirtyEntries(parsed.dirtyEntries);
 
     let remoteUrl = "";
     try {
@@ -1010,6 +1103,12 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
       behind: parsed.behind,
       dirtyCount: parsed.dirtyEntries.length,
       dirtyEntries: parsed.dirtyEntries,
+      dirtyPaths: classified.paths,
+      dirtyPreview: classified.paths.slice(0, 5),
+      safeLocalOnlyDirtyCount: classified.safeLocalOnlyPaths.length,
+      safeLocalOnlyPaths: classified.safeLocalOnlyPaths,
+      contentDirtyCount: classified.contentPaths.length,
+      contentDirtyPaths: classified.contentPaths,
       conflictedCount: countConflictEntries(parsed.dirtyEntries),
       changeSizeLabel: formatChangeSize(parsed.dirtyEntries.length),
       rebaseInProgress,
@@ -1033,6 +1132,9 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
         : " | rebase";
     } else if (snapshot.dirtyCount > 0) {
       text += ` | ${snapshot.dirtyCount} dirty`;
+      if (snapshot.contentDirtyCount === 0 && snapshot.safeLocalOnlyDirtyCount > 0) {
+        text += " (local-state)";
+      }
       if (snapshot.dirtyCount >= LARGE_CHANGE_WARNING_COUNT) {
         text += " (large)";
       }
@@ -1072,10 +1174,30 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     snapshot = await this.fetchRemote(snapshot);
 
     if (snapshot.dirtyCount > 0) {
+      if (snapshot.contentDirtyCount === 0 && snapshot.safeLocalOnlyDirtyCount > 0 && snapshot.behind > 0) {
+        const preview = formatPathPreview(snapshot.safeLocalOnlyPaths);
+        if (interactive || startup) {
+          this.notify(
+            `Vault Sync: only local-only state files are blocking pull. Discarding ${snapshot.safeLocalOnlyDirtyCount} file(s): ${preview}`,
+            10000,
+            true
+          );
+        }
+
+        await this.discardSafeLocalStateFiles(snapshot);
+        snapshot = await this.getRepositoryStatus();
+      }
+    }
+
+    if (snapshot.dirtyCount > 0) {
       if (interactive || startup) {
+        const preview = formatPathPreview(snapshot.contentDirtyPaths.length ? snapshot.contentDirtyPaths : snapshot.dirtyPaths);
+        const detail = snapshot.contentDirtyCount > 0
+          ? `${snapshot.contentDirtyCount} file(s) look like real content edits`
+          : `${snapshot.dirtyCount} local changed file(s) are present`;
         this.notify(
-          `Vault Sync: pull skipped because ${snapshot.dirtyCount} local changed file(s) are present. Save or review them first.`,
-          9000,
+          `Vault Sync: pull skipped because ${detail}. Review or save them first. ${preview}`,
+          12000,
           startup
         );
       }
@@ -1117,6 +1239,18 @@ module.exports = class VaultSyncCompanionPlugin extends Plugin {
     }
 
     snapshot = await this.fetchRemote(snapshot);
+
+    if (snapshot.contentDirtyCount === 0 && snapshot.safeLocalOnlyDirtyCount > 0 && snapshot.behind > 0 && snapshot.ahead === 0) {
+      if (interactive) {
+        this.notify(
+          "Vault Sync: only local-only state files changed on this device, so this action will switch to a safe pull instead of creating a noisy commit.",
+          10000,
+          true
+        );
+      }
+      await this.discardSafeLocalStateFiles(snapshot);
+      return await this.pullLatest({ interactive, startup: false });
+    }
 
     if (interactive && snapshot.dirtyCount >= HUGE_CHANGE_WARNING_COUNT) {
       this.notify(

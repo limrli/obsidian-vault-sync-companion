@@ -1,7 +1,7 @@
 {
   "id": "vault-sync-companion",
   "name": "Vault Sync Companion",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "minAppVersion": "1.5.0",
   "description": "Run a safe Git sync workflow for this vault from inside Obsidian.",
   "author": "OpenAI Codex",
