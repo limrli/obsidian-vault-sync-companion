@@ -227,6 +227,7 @@ const SAFE_LOCAL_STATE_PATTERNS = [
   /^\.obsidian\/plugins\/obsidian-mindmap-nextgen\/data\.json$/i,
   /^\.obsidian\/plugins\/obsidian42-brat\/data\.json$/i,
   /^\.obsidian\/plugins\/various-complements\/histories\.json$/i,
+  /^\.obsidian\/plugins\/vault-sync-companion\/data\.json$/i,
   /^\.obsidian\/plugins\/vault-sync-companion\/close-sync-[^/]+\.json$/i,
   /^\.stfolder\/.+/i
 ];
@@ -419,7 +420,8 @@ class BeginnerGuideModal extends Modal {
       "Pull Latest: downloads the newest version from your remote repository before you start writing.",
       "If both computers changed different files, Pull Latest and Save and Push now let Git try an automatic merge first.",
       "Save and Push: saves all current vault changes, creates a Git commit, then uploads it to the remote repository.",
-      "Open status panel: shows whether this computer is ahead, behind, or has unsaved changes."
+      "Open status panel: shows whether this computer is ahead, behind, or has unsaved changes.",
+      "Local-only dirty examples: workspace.json, BRAT state, recent-files data, and Vault Sync Companion's own data.json settings file."
     ].forEach((text) => actionList.createEl("li", { text }));
 
     contentEl.createEl("h3", { text: "Simple Daily Workflow" });
